@@ -37,7 +37,8 @@ Windows 单文件工具，用于分别调整 TT 语音开黑版和娱乐版的�
 需要支持 Windows 64 位目标的 MinGW-w64 GCC。在项目根目录运行：
 
 ```powershell
-x86_64-w64-mingw32-gcc -std=c11 -Wall -Wextra -Werror -O2 -municode -mwindows src/ui.c src/controller.c src/telemetry.c src/telemetry_core.c src/locator.c src/target.c -ladvapi32 -lcomdlg32 -lshell32 -lole32 -luuid -lm -o "克克咪 TT语音增强.exe"
+x86_64-w64-mingw32-windres resources/app.rc -O coff -o icon-resource.o
+x86_64-w64-mingw32-gcc -std=c11 -Wall -Wextra -Werror -O2 -municode -mwindows src/ui.c src/controller.c src/telemetry.c src/telemetry_core.c src/locator.c src/target.c icon-resource.o -ladvapi32 -lcomdlg32 -lshell32 -lole32 -luuid -lm -o "克克咪 TT语音增强.exe"
 ```
 
 源码和编译产物不包含 TT 语音客户端或其音频引擎；使用时需要自行安装受支持的 TT 语音。

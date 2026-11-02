@@ -12,6 +12,7 @@
 #include "controller.h"
 #include "telemetry.h"
 #include "locator.h"
+#include "../resources/resource.h"
 
 #define IDC_READ 1001
 #define IDC_RATE 1002
@@ -67,6 +68,7 @@ static HWND g_window, g_rate, g_current, g_status, g_read, g_apply, g_hold;
 static HWND g_live, g_extrema, g_metric_state;
 static HWND g_location, g_game, g_entertainment;
 static HFONT g_font, g_title_font, g_big_font, g_small_font;
+static HICON g_header_icon;
 static HBRUSH g_background, g_edit_background;
 static BOOL g_busy = FALSE;
 static BOOL g_metric_busy = FALSE, g_closing = FALSE, g_has_live = FALSE;
@@ -603,7 +605,11 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LP
             g_small_font = CreateFontW(-13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                                        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                                        CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
-            HWND title = make_control(0, L"STATIC", L"克克咪 TT语音增强", 0, 20, 14, 410, 28, 0);
+            g_header_icon = (HICON)LoadImageW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(IDI_APP_ICON),
+                                            IMAGE_ICON, 28, 28, LR_DEFAULTCOLOR);
+            HWND avatar = make_control(0, L"STATIC", L"", SS_ICON | SS_CENTERIMAGE, 20, 10, 28, 28, 0);
+            if (avatar && g_header_icon) SendMessageW(avatar, STM_SETICON, (WPARAM)g_header_icon, 0);
+            HWND title = make_control(0, L"STATIC", L"克克咪 TT语音增强", 0, 56, 14, 374, 28, 0);
             set_font(title, g_title_font);
             make_control(0, L"BUTTON", L"—", WS_TABSTOP | BS_OWNERDRAW, 488, 8, 35, 32, IDC_MINIMIZE);
             make_control(0, L"BUTTON", L"×", WS_TABSTOP | BS_OWNERDRAW, 527, 8, 32, 32, IDC_CLOSE);
@@ -802,6 +808,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LP
             finish_close_if_ready(window);
             return 0;
         case WM_DESTROY:
+            if (g_header_icon) DestroyIcon(g_header_icon);
             if (g_font) DeleteObject(g_font);
             if (g_title_font) DeleteObject(g_title_font);
             if (g_big_font) DeleteObject(g_big_font);
@@ -821,7 +828,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command_line, 
     wc.lpfnWndProc = window_proc;
     wc.hInstance = instance;
     wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
-    wc.hIcon = LoadIconW(NULL, IDI_APPLICATION);
+    wc.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(IDI_APP_ICON));
+    if (!wc.hIcon) wc.hIcon = LoadIconW(NULL, IDI_APPLICATION);
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     wc.lpszClassName = L"TTBitrateControllerWindow";
     if (!RegisterClassW(&wc)) return 1;
