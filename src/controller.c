@@ -5,6 +5,8 @@
 #include <string.h>
 #include <wchar.h>
 
+typedef enum { ABI_UNKNOWN, ABI_MODERN64, ABI_LEGACY64, ABI_LEGACY32 } EngineABI;
+
 typedef struct {
     HANDLE process;
     DWORD pid;
@@ -12,6 +14,7 @@ typedef struct {
     DWORD engine_size;
     uintptr_t get_audio_config;
     uintptr_t set_audio_config;
+    EngineABI abi;
 } Target;
 
 typedef struct {
@@ -89,17 +92,29 @@ static BOOL read_rva(const Target *target, DWORD rva, void *out, SIZE_T length) 
 
 static BOOL resolve_exports(Target *target) {
     IMAGE_DOS_HEADER dos;
-    IMAGE_NT_HEADERS64 nt;
+    IMAGE_NT_HEADERS64 nt64;
     IMAGE_EXPORT_DIRECTORY exports;
     if (!read_rva(target, 0, &dos, sizeof(dos)) || dos.e_magic != IMAGE_DOS_SIGNATURE ||
         dos.e_lfanew < 0 || (DWORD)dos.e_lfanew > 0x100000 ||
-        !read_rva(target, (DWORD)dos.e_lfanew, &nt, sizeof(nt)) ||
-        nt.Signature != IMAGE_NT_SIGNATURE ||
-        nt.FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 ||
-        nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
-        nt.OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_EXPORT) return FALSE;
+        !read_rva(target, (DWORD)dos.e_lfanew, &nt64, sizeof(nt64)) ||
+        nt64.Signature != IMAGE_NT_SIGNATURE) return FALSE;
 
-    IMAGE_DATA_DIRECTORY directory = nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    IMAGE_DATA_DIRECTORY directory;
+    WORD machine = nt64.FileHeader.Machine;
+    if (machine == IMAGE_FILE_MACHINE_AMD64 &&
+        nt64.OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC &&
+        nt64.OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_EXPORT) {
+        directory = nt64.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    } else if (machine == IMAGE_FILE_MACHINE_I386) {
+        IMAGE_NT_HEADERS32 nt32;
+        if (!read_rva(target, (DWORD)dos.e_lfanew, &nt32, sizeof(nt32)) ||
+            nt32.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC ||
+            nt32.OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_EXPORT) return FALSE;
+        directory = nt32.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    } else {
+        return FALSE;
+    }
+
     if (!directory.VirtualAddress || directory.Size < sizeof(exports) ||
         !read_rva(target, directory.VirtualAddress, &exports, sizeof(exports)) ||
         !exports.NumberOfNames || exports.NumberOfNames > 100000 ||
@@ -139,6 +154,31 @@ static BOOL resolve_exports(Target *target) {
          (uint64_t)get_rva < (uint64_t)directory.VirtualAddress + directory.Size) ||
         ((uint64_t)set_rva >= directory.VirtualAddress &&
          (uint64_t)set_rva < (uint64_t)directory.VirtualAddress + directory.Size)) return FALSE;
+
+    /* SDK 3.21 and 3.25 export the same names with different calling conventions. */
+    static const unsigned char get_modern64[] = {0x4c,0x8b,0xc2,0x33,0xd2};
+    static const unsigned char get_legacy64[] = {0x48,0x8b,0xd1,0x33,0xc9};
+    static const unsigned char set_modern64[] = {0x48,0x83,0xec,0x38,0xf2,0x0f,0x10,0x02};
+    static const unsigned char set_legacy64[] = {0x48,0x83,0xec,0x38,0xf2,0x0f,0x10,0x01};
+    static const unsigned char get_legacy32[] = {0x55,0x8b,0xec,0xff,0x75,0x08,0x6a,0x00};
+    static const unsigned char set_legacy32[] = {0x55,0x8b,0xec,0xf3,0x0f,0x7e,0x45,0x08,0x8b,0x45,0x10};
+    unsigned char get_code[12], set_code[12];
+    if (!read_rva(target, get_rva, get_code, sizeof(get_code)) ||
+        !read_rva(target, set_rva, set_code, sizeof(set_code))) return FALSE;
+    target->abi = ABI_UNKNOWN;
+    if (machine == IMAGE_FILE_MACHINE_AMD64 && (get_code[5] == 0xe9 || get_code[5] == 0xeb)) {
+        if (memcmp(get_code, get_modern64, sizeof(get_modern64)) == 0 &&
+            memcmp(set_code, set_modern64, sizeof(set_modern64)) == 0)
+            target->abi = ABI_MODERN64;
+        else if (memcmp(get_code, get_legacy64, sizeof(get_legacy64)) == 0 &&
+                 memcmp(set_code, set_legacy64, sizeof(set_legacy64)) == 0)
+            target->abi = ABI_LEGACY64;
+    } else if (machine == IMAGE_FILE_MACHINE_I386 &&
+               memcmp(get_code, get_legacy32, sizeof(get_legacy32)) == 0 &&
+               memcmp(set_code, set_legacy32, sizeof(set_legacy32)) == 0) {
+        target->abi = ABI_LEGACY32;
+    }
+    if (target->abi == ABI_UNKNOWN) return FALSE;
     target->get_audio_config = target->engine_base + get_rva;
     target->set_audio_config = target->engine_base + set_rva;
     return TRUE;
@@ -166,27 +206,61 @@ static TTCode remote_prepare(const Target *target, RemoteCall *remote, DWORD *sy
 }
 
 static TTCode remote_call(const Target *target, RemoteCall *remote, uintptr_t function,
-                          DWORD *system_error) {
-    unsigned char stub[] = {
-        0x48, 0x83, 0xec, 0x28,             /* stack alignment and shadow space */
-        0x48, 0x31, 0xc9,                   /* engine index 0 */
-        0x48, 0xba, 0,0,0,0,0,0,0,0,       /* rdx = configuration */
-        0x48, 0xb8, 0,0,0,0,0,0,0,0,       /* rax = SDK export */
-        0xff, 0xd0,                         /* call rax */
-        0x48, 0x83, 0xc4, 0x28, 0xc3
-    };
-    memcpy(stub + 9, &remote->data, sizeof(uint64_t));
-    memcpy(stub + 19, &function, sizeof(uint64_t));
+                          BOOL set, DWORD *system_error) {
+    unsigned char stub[40];
+    SIZE_T stub_length = 0;
+    uint64_t data64 = (uint64_t)remote->data, function64 = (uint64_t)function;
+    if (target->abi == ABI_MODERN64) {
+        const unsigned char code[] = {
+            0x48,0x83,0xec,0x28, 0x48,0x31,0xc9,
+            0x48,0xba,0,0,0,0,0,0,0,0, 0x48,0xb8,0,0,0,0,0,0,0,0,
+            0xff,0xd0, 0x48,0x83,0xc4,0x28,0xc3
+        };
+        stub_length = sizeof(code); memcpy(stub, code, stub_length);
+        memcpy(stub + 9, &data64, sizeof(data64));
+        memcpy(stub + 19, &function64, sizeof(function64));
+    } else if (target->abi == ABI_LEGACY64) {
+        const unsigned char code[] = {
+            0x48,0x83,0xec,0x28, 0x48,0xb9,0,0,0,0,0,0,0,0,
+            0x48,0xb8,0,0,0,0,0,0,0,0, 0xff,0xd0, 0x48,0x83,0xc4,0x28,0xc3
+        };
+        stub_length = sizeof(code); memcpy(stub, code, stub_length);
+        memcpy(stub + 6, &data64, sizeof(data64));
+        memcpy(stub + 16, &function64, sizeof(function64));
+    } else if (target->abi == ABI_LEGACY32 && remote->data <= UINT32_MAX &&
+               remote->code <= UINT32_MAX && function <= UINT32_MAX) {
+        uint32_t data32 = (uint32_t)remote->data, function32 = (uint32_t)function;
+        if (set) {
+            /* The 32-bit setter receives the 12-byte configuration by value. */
+            const unsigned char code[] = {
+                0xb8,0,0,0,0, 0xff,0x70,0x08, 0xff,0x70,0x04, 0xff,0x30,
+                0xb8,0,0,0,0, 0xff,0xd0, 0x83,0xc4,0x0c, 0xc2,0x04,0x00
+            };
+            stub_length = sizeof(code); memcpy(stub, code, stub_length);
+            memcpy(stub + 1, &data32, sizeof(data32));
+            memcpy(stub + 14, &function32, sizeof(function32));
+        } else {
+            const unsigned char code[] = {
+                0x68,0,0,0,0, 0xb8,0,0,0,0, 0xff,0xd0, 0x83,0xc4,0x04, 0xc2,0x04,0x00
+            };
+            stub_length = sizeof(code); memcpy(stub, code, stub_length);
+            memcpy(stub + 1, &data32, sizeof(data32));
+            memcpy(stub + 6, &function32, sizeof(function32));
+        }
+    } else {
+        *system_error = ERROR_INVALID_ADDRESS;
+        return TT_REMOTE_FAILED;
+    }
     DWORD old_protect = 0;
     if (!VirtualProtectEx(target->process, (LPVOID)remote->code, 4096, PAGE_READWRITE, &old_protect)) {
         *system_error = GetLastError();
         return TT_REMOTE_FAILED;
     }
     SIZE_T written = 0;
-    if (!WriteProcessMemory(target->process, (LPVOID)remote->code, stub, sizeof(stub), &written) ||
-        written != sizeof(stub) ||
+    if (!WriteProcessMemory(target->process, (LPVOID)remote->code, stub, stub_length, &written) ||
+        written != stub_length ||
         !VirtualProtectEx(target->process, (LPVOID)remote->code, 4096, PAGE_EXECUTE_READ, &old_protect) ||
-        !FlushInstructionCache(target->process, (LPCVOID)remote->code, sizeof(stub))) {
+        !FlushInstructionCache(target->process, (LPCVOID)remote->code, stub_length)) {
         *system_error = GetLastError();
         return TT_REMOTE_FAILED;
     }
@@ -225,7 +299,7 @@ static TTCode remote_get(const Target *target, RemoteCall *remote, AudioConfig *
         *system_error = GetLastError();
         return TT_REMOTE_FAILED;
     }
-    TTCode code = remote_call(target, remote, target->get_audio_config, system_error);
+    TTCode code = remote_call(target, remote, target->get_audio_config, FALSE, system_error);
     if (code != TT_OK) return code;
     if (!read_bytes(target->process, remote->data, config, sizeof(*config))) {
         *system_error = GetLastError();
@@ -261,7 +335,7 @@ static TTResult perform(TTEdition edition, BOOL set, int bitrate) {
                 result.code = TT_REMOTE_FAILED;
                 result.system_error = GetLastError();
             } else {
-                result.code = remote_call(&target, &remote, target.set_audio_config, &result.system_error);
+                result.code = remote_call(&target, &remote, target.set_audio_config, TRUE, &result.system_error);
                 if (result.code == TT_OK) {
                     result.code = remote_get(&target, &remote, &result.config, &result.system_error);
                     if (result.code == TT_OK && result.config.bitrate != bitrate)

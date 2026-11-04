@@ -69,7 +69,7 @@ int main(void) {
     if (!require(tt_sample_core(read_fake, NULL, base, &rate) == TT_SAMPLE_WAITING, "invalid publisher list bounds are rejected")) return 1;
 
     memset(cells, 0, sizeof(cells)); cell_count = 0;
-    const TTLayout entertainment = {0x21165d8, 0x1b82b48, 0x1b3a5d8, 0x1b3ace8};
+    const TTLayout entertainment = {0x21165d8, 0x1b82b48, 0x1b3a5d8, 0x1b3ace8, TT_LAYOUT_MODERN64};
     pointer(base + entertainment.engine_singleton, ROOT); pointer(ROOT + 0x20, GATE);
     pointer(GATE + 0xd0, CHANNELS); pointer(GATE + 0xd8, CHANNELS + 16);
     pointer(CHANNELS, CHANNEL); pointer(CHANNEL + 0x10, NATIVE);

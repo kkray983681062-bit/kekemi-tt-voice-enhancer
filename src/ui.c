@@ -517,8 +517,8 @@ static void choose_tt(void) {
         return;
     }
     if (!tt_location_validate_for(g_edition, selected, normalized)) {
-        status_text(g_edition == TT_EDITION_GAME ? L"请选择 64 位开黑版 TTVoice.exe。" :
-                    L"请选择 64 位 TT语音娱乐版.exe。", TRUE);
+        status_text(g_edition == TT_EDITION_GAME ? L"请选择开黑版 TTVoice.exe。" :
+                    L"请选择 TT语音娱乐版.exe。", TRUE);
         return;
     }
     ++state->location_generation;

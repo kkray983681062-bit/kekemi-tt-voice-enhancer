@@ -26,21 +26,21 @@ static DWORD WINAPI reset_once(LPVOID unused) {
     return 0;
 }
 
-__declspec(dllexport) int zego_express_get_audio_config(int index, AudioConfig *out) {
+int mock_get_by_channel(int index, int channel, AudioConfig *out) {
     (void)index;
-    if (!out) return 1;
+    if (channel != 0 || !out) return 1;
     *out = current;
     record_event("GET", out);
     return getenv("TT_MOCK_GET_ERROR") ? 10010 : 0;
 }
 
-__declspec(dllexport) int zego_express_set_audio_config(int index, const AudioConfig *config) {
+int mock_set_by_channel(int index, AudioConfig config, int channel) {
     (void)index;
-    if (!config) return 1;
-    record_event("SET", config);
+    if (channel != 0) return 1;
+    record_event("SET", &config);
     const char *error = getenv("TT_MOCK_SET_ERROR");
     if (error) return atoi(error);
-    current = *config;
+    current = config;
     if (getenv("TT_MOCK_CLAMP")) current.bitrate = 128;
     if (getenv("TT_MOCK_RESET_ONCE") && InterlockedCompareExchange(&reset_scheduled, 1, 0) == 0) {
         HANDLE thread = CreateThread(NULL, 0, reset_once, NULL, 0, NULL);
@@ -48,6 +48,8 @@ __declspec(dllexport) int zego_express_set_audio_config(int index, const AudioCo
     }
     return 0;
 }
+
+#include "mock_modern_exports.h"
 
 BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID reserved) {
     (void)module; (void)reason; (void)reserved;

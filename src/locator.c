@@ -41,7 +41,8 @@ BOOL tt_location_validate_for(TTEdition edition, const wchar_t *input, wchar_t *
     DWORD attributes = GetFileAttributesW(full);
     if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY)) return FALSE;
     DWORD binary_type = 0;
-    if (!GetBinaryTypeW(full, &binary_type) || binary_type != SCS_64BIT_BINARY) return FALSE;
+    if (!GetBinaryTypeW(full, &binary_type) ||
+        (binary_type != SCS_64BIT_BINARY && binary_type != SCS_32BIT_BINARY)) return FALSE;
     return SUCCEEDED(StringCchCopyW(normalized, TT_PATH_CAP, full));
 }
 

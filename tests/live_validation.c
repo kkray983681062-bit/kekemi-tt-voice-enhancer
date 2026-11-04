@@ -10,7 +10,7 @@ static TTCode put_config(Target *target, RemoteCall *remote, const AudioConfig *
         *error = GetLastError();
         return TT_REMOTE_FAILED;
     }
-    return remote_call(target, remote, target->set_audio_config, error);
+    return remote_call(target, remote, target->set_audio_config, TRUE, error);
 }
 
 static BOOL same_config(const AudioConfig *a, const AudioConfig *b) {

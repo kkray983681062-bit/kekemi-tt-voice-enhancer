@@ -6,12 +6,14 @@
 
 typedef int (*TTMemoryReader)(void *context, uintptr_t address, void *out, size_t length);
 typedef enum { TT_SAMPLE_WAITING, TT_SAMPLE_ACTIVE } TTSampleState;
+typedef enum { TT_LAYOUT_MODERN64, TT_LAYOUT_LEGACY64, TT_LAYOUT_LEGACY32 } TTLayoutKind;
 
 typedef struct {
     uintptr_t engine_singleton;
     uintptr_t native_vtable;
     uintptr_t publisher_vtable;
     uintptr_t stream_vtable;
+    TTLayoutKind kind;
 } TTLayout;
 
 /* Only call this layout for the exact verified ZEGO build. */
