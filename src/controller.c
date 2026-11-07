@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
+#include <wincrypt.h>
 
 typedef enum { ABI_UNKNOWN, ABI_MODERN64, ABI_LEGACY64, ABI_LEGACY32 } EngineABI;
 
@@ -15,6 +16,7 @@ typedef struct {
     uintptr_t get_audio_config;
     uintptr_t set_audio_config;
     EngineABI abi;
+    wchar_t engine_path[MAX_PATH];
 } Target;
 
 typedef struct {
@@ -45,6 +47,8 @@ const char *tt_code_name(TTCode code) {
         case TT_REMOTE_FAILED: return "REMOTE_FAILED";
         case TT_REMOTE_TIMEOUT: return "REMOTE_TIMEOUT";
         case TT_READBACK_MISMATCH: return "READBACK_MISMATCH";
+        case TT_CHANNEL_NOT_EFFECTIVE: return "CHANNEL_NOT_EFFECTIVE";
+        case TT_RESTORE_FAILED: return "RESTORE_FAILED";
         default: return "SYSTEM_ERROR";
     }
 }
@@ -74,6 +78,7 @@ static TTResult find_target(TTEdition edition, Target *target) {
     target->pid = found.pid;
     target->engine_base = found.engine_base;
     target->engine_size = found.engine_size;
+    memcpy(target->engine_path, found.engine_path, sizeof(target->engine_path));
     TTResult result = result_of(TT_OK, 0);
     result.pid = found.pid;
     return result;
@@ -353,3 +358,187 @@ TTResult tt_read_config_for(TTEdition edition) { return perform(edition, FALSE, 
 TTResult tt_apply_bitrate_for(TTEdition edition, int bitrate) { return perform(edition, TRUE, bitrate); }
 TTResult tt_read_config(void) { return tt_read_config_for(TT_EDITION_GAME); }
 TTResult tt_apply_bitrate(int bitrate) { return tt_apply_bitrate_for(TT_EDITION_GAME, bitrate); }
+
+/* These scalar layouts are restricted to fully fingerprinted game/entertainment DLLs.
+   They describe capture and encoder settings, never PCM or conversation data. */
+typedef struct {
+    int mode, engine_mode, capture_channels, pending_channels, encoder_channels;
+} TTChannelSnapshot;
+
+typedef struct {
+    unsigned char sha256[32];
+    DWORD image_size;
+    uintptr_t capture_rva, mode_write_rva, encoder_write_rva, audio_root;
+    uintptr_t device_vtable, engine_vtable, encoder_vtable, sessions_offset;
+} TTChannelLayout;
+
+static const TTChannelLayout channel_layouts[] = {
+    {{0x7a,0xb8,0x98,0x26,0xd7,0x4a,0xcd,0x0f,0xc7,0x07,0x44,0xee,0x90,0xd7,0x1e,0x61,
+      0xf2,0xd2,0x20,0xbd,0xa0,0x39,0x50,0x90,0x96,0xd9,0x9d,0xe9,0x9e,0x14,0x9a,0xf3},
+     0x2289000,0xb97b10,0xbead0f,0xc5d47e,0x20a4380,0x1947f60,0x1960750,0x1956760,0x226f08},
+    {{0x08,0x7e,0x1a,0x9e,0xd2,0x95,0x49,0x23,0x4a,0xe8,0xe5,0xf7,0x87,0x17,0x49,0x3e,
+      0x1f,0x29,0xef,0x2e,0x7a,0xf3,0x9a,0x15,0xa4,0x51,0xa4,0x18,0xb1,0xbc,0x02,0x03},
+     0x336f000,0xc42920,0xc9c01f,0xd23bae,0x2115d80,0x1bbae10,0x1bd6260,0x1bcc300,0x2284e0}
+};
+
+static const TTChannelLayout *stereo_layout(const Target *target) {
+    for (unsigned i = 0; i < sizeof(channel_layouts) / sizeof(channel_layouts[0]); ++i)
+        if (target->engine_size == channel_layouts[i].image_size) return &channel_layouts[i];
+    return NULL;
+}
+
+static BOOL stereo_profile(const Target *target) {
+    const TTChannelLayout *layout = stereo_layout(target);
+    if (!layout) return FALSE;
+    HANDLE file = CreateFileW(target->engine_path, GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
+    if (file == INVALID_HANDLE_VALUE) return FALSE;
+    HCRYPTPROV provider = 0; HCRYPTHASH hash = 0;
+    BOOL ok = CryptAcquireContextW(&provider, NULL, NULL, PROV_RSA_AES, CRYPT_VERIFYCONTEXT) &&
+        CryptCreateHash(provider, CALG_SHA_256, 0, 0, &hash);
+    unsigned char buffer[65536], digest[32]; DWORD count;
+    while (ok) {
+        if (!ReadFile(file, buffer, sizeof(buffer), &count, NULL)) { ok = FALSE; break; }
+        if (!count) break;
+        ok = CryptHashData(hash, buffer, count, 0);
+    }
+    count = sizeof(digest);
+    if (ok) ok = CryptGetHashParam(hash, HP_HASHVAL, digest, &count, 0) &&
+        count == sizeof(digest) && memcmp(digest, layout->sha256, sizeof(digest)) == 0;
+    if (hash) CryptDestroyHash(hash);
+    if (provider) CryptReleaseContext(provider, 0);
+    CloseHandle(file);
+    if (!ok) return FALSE;
+    static const unsigned char capture_code[] = {0x48,0x89,0x5c,0x24,0x08,0x48,0x89,0x74,0x24,0x10,0x57,0x48};
+    static const unsigned char state_code[] = {0x89,0x9f,0x84,0x07,0x00,0x00};
+    static const unsigned char encoder_code[] = {0x89,0xb3,0x44,0x01,0x00,0x00};
+    unsigned char loaded[12];
+    return read_rva(target, (DWORD)layout->capture_rva, loaded, sizeof(capture_code)) &&
+        memcmp(loaded, capture_code, sizeof(capture_code)) == 0 &&
+        read_rva(target, (DWORD)layout->mode_write_rva, loaded, sizeof(state_code)) &&
+        memcmp(loaded, state_code, sizeof(state_code)) == 0 &&
+        read_rva(target, (DWORD)layout->encoder_write_rva, loaded, sizeof(encoder_code)) &&
+        memcmp(loaded, encoder_code, sizeof(encoder_code)) == 0;
+}
+
+static BOOL channel_snapshot(const Target *target, TTChannelSnapshot *state) {
+    const TTChannelLayout *layout = stereo_layout(target);
+    uintptr_t audio, device, engine, sessions, encoder, codec, table, again;
+    int configured_channels;
+    if (!layout || !read_bytes(target->process, target->engine_base + layout->audio_root, &audio, 8) || !audio ||
+        !read_bytes(target->process, audio + 0x60, &device, 8) || !device ||
+        !read_bytes(target->process, device, &table, 8) || table != target->engine_base + layout->device_vtable ||
+        !read_bytes(target->process, device + 0x748, &engine, 8) || !engine ||
+        !read_bytes(target->process, engine, &table, 8) || table != target->engine_base + layout->engine_vtable ||
+        !read_bytes(target->process, device + layout->sessions_offset, &sessions, 8) || !sessions ||
+        !read_bytes(target->process, sessions + 0xd8, &encoder, 8) || !encoder ||
+        !read_bytes(target->process, encoder, &table, 8) || table != target->engine_base + layout->encoder_vtable ||
+        !read_bytes(target->process, encoder + 0x118, &codec, 8) || !codec ||
+        !read_bytes(target->process, codec + 8, &table, 8) || table < target->engine_base ||
+        table - target->engine_base >= target->engine_size ||
+        !read_bytes(target->process, device + 0x784, &state->mode, 4) ||
+        !read_bytes(target->process, engine + 0x2cc, &state->engine_mode, 4) ||
+        !read_bytes(target->process, engine + 0x3474, &state->capture_channels, 4) ||
+        !read_bytes(target->process, engine + 0x3d34, &state->pending_channels, 4) ||
+        !read_bytes(target->process, encoder + 0x144, &configured_channels, 4) ||
+        !read_bytes(target->process, codec + 0x64, &state->encoder_channels, 4) ||
+        configured_channels != state->encoder_channels ||
+        !read_bytes(target->process, target->engine_base + layout->audio_root, &again, 8) || again != audio ||
+        !read_bytes(target->process, audio + 0x60, &again, 8) || again != device ||
+        !read_bytes(target->process, device + 0x748, &again, 8) || again != engine ||
+        !read_bytes(target->process, device + layout->sessions_offset, &again, 8) || again != sessions ||
+        !read_bytes(target->process, sessions + 0xd8, &again, 8) || again != encoder ||
+        !read_bytes(target->process, encoder + 0x118, &again, 8) || again != codec) return FALSE;
+    return state->mode >= 0 && state->mode <= 2 && state->engine_mode >= 0 && state->engine_mode <= 2 &&
+        state->capture_channels >= 1 && state->capture_channels <= 2 &&
+        state->pending_channels >= 1 && state->pending_channels <= 2 &&
+        state->encoder_channels >= 1 && state->encoder_channels <= 2;
+}
+
+static TTCode remote_capture_mode(const Target *target, RemoteCall *remote, int mode, DWORD *error) {
+    const TTChannelLayout *layout = stereo_layout(target);
+    if (!layout) return TT_ENGINE_UNSUPPORTED;
+    unsigned char shim[] = {0xba,0,0,0,0,0x48,0xb8,0,0,0,0,0,0,0,0,0xff,0xe0};
+    uint64_t function = target->engine_base + layout->capture_rva;
+    memcpy(shim + 1, &mode, 4); memcpy(shim + 7, &function, 8);
+    DWORD old; SIZE_T written;
+    if (!VirtualProtectEx(target->process, (LPVOID)remote->code, 4096, PAGE_READWRITE, &old) ||
+        !WriteProcessMemory(target->process, (LPVOID)(remote->code + 128), shim, sizeof(shim), &written) ||
+        written != sizeof(shim) ||
+        !FlushInstructionCache(target->process, (LPCVOID)(remote->code + 128), sizeof(shim))) {
+        *error = GetLastError(); return TT_REMOTE_FAILED;
+    }
+    return remote_call(target, remote, remote->code + 128, FALSE, error);
+}
+
+static TTCode remote_config(const Target *target, RemoteCall *remote, const AudioConfig *config, DWORD *error) {
+    SIZE_T written;
+    if (!WriteProcessMemory(target->process, (LPVOID)remote->data, config, sizeof(*config), &written) ||
+        written != sizeof(*config)) { *error = GetLastError(); return TT_REMOTE_FAILED; }
+    return remote_call(target, remote, target->set_audio_config, TRUE, error);
+}
+
+static BOOL wait_channel_snapshot(const Target *target, const TTChannelSnapshot *expected, TTChannelSnapshot *observed) {
+    for (unsigned attempt = 0; attempt < 40; ++attempt) {
+        if (channel_snapshot(target, observed) && memcmp(expected, observed, sizeof(*expected)) == 0) return TRUE;
+        Sleep(50);
+    }
+    return FALSE;
+}
+
+TTResult tt_apply_channels_for(TTEdition edition, int channels) {
+    if (channels != 1 && channels != 2) return result_of(TT_OUT_OF_RANGE, 0);
+    if (edition < TT_EDITION_GAME || edition >= TT_EDITION_COUNT) return result_of(TT_ENGINE_UNSUPPORTED, 0);
+    Target target;
+    TTResult result = find_target(edition, &target);
+    if (result.code != TT_OK) return result;
+    RemoteCall remote = {0};
+    AudioConfig original, requested;
+    TTChannelSnapshot before, after;
+    if (!resolve_exports(&target) || target.abi != ABI_MODERN64 || !stereo_profile(&target)) {
+        result.code = TT_ENGINE_UNSUPPORTED; goto done_channels;
+    }
+    if (!channel_snapshot(&target, &before)) { result.code = TT_ENGINE_NOT_READY; goto done_channels; }
+    result.code = remote_prepare(&target, &remote, &result.system_error);
+    if (result.code != TT_OK) goto done_channels;
+    result.code = remote_get(&target, &remote, &original, &result.system_error);
+    if (result.code != TT_OK) goto done_channels;
+    result.config = original;
+    if (original.bitrate > TT_MAX_KBPS) { result.code = TT_OUT_OF_RANGE; goto done_channels; }
+    requested = original; requested.channel = channels;
+    result.code = remote_capture_mode(&target, &remote, channels == 2 ? 1 : 0, &result.system_error);
+    if (result.code == TT_REMOTE_TIMEOUT) goto done_channels;
+    if (result.code == TT_OK) result.code = remote_config(&target, &remote, &requested, &result.system_error);
+    if (result.code == TT_REMOTE_TIMEOUT) goto done_channels;
+    if (result.code == TT_OK) result.code = remote_get(&target, &remote, &result.config, &result.system_error);
+    if (result.code == TT_REMOTE_TIMEOUT) goto done_channels;
+    if (result.code == TT_OK && memcmp(&requested, &result.config, sizeof(requested))) result.code = TT_READBACK_MISMATCH;
+    if (result.code == TT_OK) {
+        TTChannelSnapshot expected = {channels == 2 ? 1 : 0, channels == 2 ? 1 : 0, channels, channels, channels};
+        if (wait_channel_snapshot(&target, &expected, &after)) {
+            result.capture_channels = after.capture_channels;
+            result.encoder_channels = after.encoder_channels;
+            goto done_channels;
+        }
+        result.code = TT_CHANNEL_NOT_EFFECTIVE;
+    }
+    /* Roll back both settings, including an independently chosen original capture mode. */
+    {
+        TTCode primary = result.code;
+        DWORD primary_error = result.system_error, error = 0;
+        TTCode restore_config = remote_config(&target, &remote, &original, &error);
+        if (restore_config == TT_REMOTE_TIMEOUT) { result.code = TT_REMOTE_TIMEOUT; result.system_error = error; goto done_channels; }
+        TTCode restore_capture = remote_capture_mode(&target, &remote, before.mode, &error);
+        if (restore_capture == TT_REMOTE_TIMEOUT) { result.code = TT_REMOTE_TIMEOUT; result.system_error = error; goto done_channels; }
+        TTCode readback = remote_get(&target, &remote, &result.config, &error);
+        if (readback == TT_REMOTE_TIMEOUT) { result.code = TT_REMOTE_TIMEOUT; result.system_error = error; goto done_channels; }
+        if (restore_config != TT_OK || restore_capture != TT_OK || readback != TT_OK ||
+            memcmp(&original, &result.config, sizeof(original)) || !wait_channel_snapshot(&target, &before, &after)) {
+            result.code = TT_RESTORE_FAILED; result.system_error = error;
+        } else { result.code = primary; result.system_error = primary_error; }
+    }
+done_channels:
+    remote_free(&target, &remote);
+    CloseHandle(target.process);
+    return result;
+}

@@ -27,6 +27,8 @@
 #define IDC_START_TT 1011
 #define IDC_GAME 1012
 #define IDC_ENTERTAINMENT 1013
+#define IDC_MONO 1014
+#define IDC_STEREO 1015
 #define IDT_HOLD 1
 #define IDT_METRIC 2
 #define WM_WORK_DONE (WM_APP + 1)
@@ -37,7 +39,7 @@
 #define TT_ERROR_ELEVATION_REQUIRED 740u
 #define CHART_SAMPLES 31
 #define WINDOW_WIDTH 568
-#define WINDOW_HEIGHT 657
+#define WINDOW_HEIGHT 713
 
 typedef struct {
     HWND window;
@@ -45,6 +47,7 @@ typedef struct {
     BOOL automatic;
     TTEdition edition;
     int desired;
+    int channels;
     TTResult result;
 } Work;
 
@@ -67,6 +70,7 @@ typedef struct {
 static HWND g_window, g_rate, g_current, g_status, g_read, g_apply, g_hold;
 static HWND g_live, g_extrema, g_metric_state;
 static HWND g_location, g_game, g_entertainment;
+static HWND g_mono, g_stereo;
 static HFONT g_font, g_title_font, g_big_font, g_small_font;
 static HICON g_header_icon;
 static HBRUSH g_background, g_edit_background;
@@ -103,7 +107,8 @@ static void show_config_for(TTEdition edition, const AudioConfig *config) {
     state->has_config = TRUE;
     if (edition != g_edition) return;
     wchar_t text[100];
-    swprintf(text, sizeof(text) / sizeof(text[0]), L"当前配置：%d kbps", config->bitrate);
+    swprintf(text, sizeof(text) / sizeof(text[0]), L"当前配置：%d kbps · %ls", config->bitrate,
+             config->channel == 2 ? L"双声道" : L"单声道");
     SetWindowTextW(g_current, text);
 }
 
@@ -177,13 +182,14 @@ static void show_error(TTEdition edition, const TTResult *result, int desired) {
 
 static DWORD WINAPI worker_main(LPVOID argument) {
     Work *work = (Work *)argument;
-    work->result = work->apply ? tt_apply_bitrate_for(work->edition, work->desired) :
+    work->result = work->channels ? tt_apply_channels_for(work->edition, work->channels) :
+                    work->apply ? tt_apply_bitrate_for(work->edition, work->desired) :
                                   tt_read_config_for(work->edition);
     if (!PostMessageW(work->window, WM_WORK_DONE, 0, (LPARAM)work)) free(work);
     return 0;
 }
 
-static void start_work(TTEdition edition, BOOL apply, int desired, BOOL automatic) {
+static void start_operation(TTEdition edition, BOOL apply, int desired, BOOL automatic, int channels) {
     if (g_busy) return;
     Work *work = (Work *)calloc(1, sizeof(*work));
     if (!work) {
@@ -195,20 +201,28 @@ static void start_work(TTEdition edition, BOOL apply, int desired, BOOL automati
     work->apply = apply;
     work->automatic = automatic;
     work->desired = desired;
+    work->channels = channels;
     g_busy = TRUE;
     EnableWindow(g_read, FALSE); EnableWindow(g_apply, FALSE);
     EnableWindow(g_game, FALSE); EnableWindow(g_entertainment, FALSE);
-    if (!automatic) status_for(edition, apply ? L"正在设置并回读，请稍候…" : L"正在读取，请稍候…", FALSE);
+    EnableWindow(g_mono, FALSE); EnableWindow(g_stereo, FALSE);
+    if (!automatic) status_for(edition, channels ? L"正在切换声道并检查本机音频状态…" :
+                              apply ? L"正在设置并回读，请稍候…" : L"正在读取，请稍候…", FALSE);
     HANDLE thread = CreateThread(NULL, 0, worker_main, work, 0, NULL);
     if (!thread) {
         free(work);
         g_busy = FALSE;
         EnableWindow(g_read, TRUE); EnableWindow(g_apply, TRUE);
         EnableWindow(g_game, TRUE); EnableWindow(g_entertainment, TRUE);
+        EnableWindow(g_mono, TRUE); EnableWindow(g_stereo, TRUE);
         status_for(edition, L"无法启动读取任务，请重试。", TRUE);
         return;
     }
     CloseHandle(thread);
+}
+
+static void start_work(TTEdition edition, BOOL apply, int desired, BOOL automatic) {
+    start_operation(edition, apply, desired, automatic, 0);
 }
 
 static HWND make_control(DWORD extended, const wchar_t *kind, const wchar_t *text,
@@ -226,6 +240,33 @@ static void finish_work(Work *work) {
     g_busy = FALSE;
     EnableWindow(g_read, TRUE); EnableWindow(g_apply, TRUE);
     EnableWindow(g_game, TRUE); EnableWindow(g_entertainment, TRUE);
+    EnableWindow(g_mono, TRUE); EnableWindow(g_stereo, TRUE);
+    if (work->channels) {
+        if (work->result.code == TT_OK) {
+            show_config_for(edition, &work->result.config);
+            wchar_t text[160];
+            swprintf(text, sizeof(text) / sizeof(text[0]),
+                     L"%ls已在本机生效，保留 %d kbps。对端效果请试听确认。",
+                     work->channels == 2 ? L"双声道" : L"单声道", work->result.config.bitrate);
+            status_for(edition, text, FALSE);
+        } else if (work->result.code == TT_ENGINE_UNSUPPORTED) {
+            status_for(edition, L"声道切换支持已验证的开黑版／娱乐版引擎；当前版本尚未适配。", TRUE);
+        } else if (work->result.code == TT_ENGINE_NOT_READY) {
+            status_for(edition, L"请先进入当前版本的语音房间并上麦，再切换声道。", TRUE);
+        } else if (work->result.code == TT_CHANNEL_NOT_EFFECTIVE || work->result.code == TT_READBACK_MISMATCH) {
+            show_config_for(edition, &work->result.config);
+            status_for(edition, L"声道切换未完整生效，已恢复切换前的设置。请检查声卡输入。", TRUE);
+        } else if (work->result.code == TT_RESTORE_FAILED || work->result.code == TT_REMOTE_TIMEOUT) {
+            stop_holding(edition, TRUE);
+            status_for(edition, L"声道状态或恢复结果未确认。自动保持已停止，请重启 TT 后再试。", TRUE);
+        } else if (work->result.code == TT_OUT_OF_RANGE) {
+            status_for(edition, L"当前码率超出可恢复范围，请先设为 6–192 kbps 再切换声道。", TRUE);
+        } else {
+            show_error(edition, &work->result, work->result.config.bitrate);
+        }
+        free(work);
+        return;
+    }
     if (work->automatic) state->next_hold = GetTickCount64() + 10000;
     if (work->result.code == TT_OK) {
         show_config_for(edition, &work->result.config);
@@ -555,6 +596,8 @@ static void select_edition(TTEdition edition) {
     GetWindowTextW(g_rate, previous->input, (int)(sizeof(previous->input) / sizeof(previous->input[0])));
     previous->hold_checked = SendMessageW(g_hold, BM_GETCHECK, 0, 0) == BST_CHECKED;
     g_edition = edition;
+    EnableWindow(g_mono, TRUE);
+    EnableWindow(g_stereo, TRUE);
     EditionState *state = &g_states[edition];
     ++g_metric_generation;
     InvalidateRect(g_game, NULL, TRUE); InvalidateRect(g_entertainment, NULL, TRUE);
@@ -633,7 +676,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LP
             g_metric_state = make_control(0, L"STATIC", L"推流状态：正在检测", 0, 24, 365, 500, 24, 0);
 
             g_current = make_control(0, L"STATIC", L"当前配置：尚未读取", 0, 24, 406, 335, 25, IDC_CURRENT);
-            g_read = make_control(0, L"BUTTON", L"读取当前码率", WS_TABSTOP | BS_OWNERDRAW,
+            g_read = make_control(0, L"BUTTON", L"读取当前配置", WS_TABSTOP | BS_OWNERDRAW,
                                   397, 399, 146, 36, IDC_READ);
             make_control(0, L"STATIC", L"目标码率", 0, 24, 454, 80, 25, 0);
             g_rate = make_control(0, L"EDIT", L"192",
@@ -646,16 +689,21 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LP
             g_hold = make_control(0, L"BUTTON", L"应用后自动保持（两版独立；关闭工具后停止）",
                                   WS_TABSTOP | BS_AUTOCHECKBOX, 24, 492, 465, 27, IDC_HOLD);
             SendMessageW(g_hold, BM_SETCHECK, BST_CHECKED, 0);
-            g_status = make_control(0, L"STATIC", L"等待操作。", SS_LEFT, 24, 528, 520, 46, IDC_STATUS);
+            make_control(0, L"STATIC", L"声道（保持码率）", 0, 24, 541, 180, 25, 0);
+            g_mono = make_control(0, L"BUTTON", L"设为单声道", WS_TABSTOP | BS_OWNERDRAW,
+                                  246, 530, 141, 36, IDC_MONO);
+            g_stereo = make_control(0, L"BUTTON", L"设为双声道", WS_TABSTOP | BS_OWNERDRAW,
+                                    397, 530, 146, 36, IDC_STEREO);
+            g_status = make_control(0, L"STATIC", L"等待操作。", SS_LEFT, 24, 584, 520, 46, IDC_STATUS);
             g_location = make_control(0, L"STATIC", L"TT：正在自动查找…", SS_PATHELLIPSIS | SS_NOPREFIX,
-                                      24, 582, 318, 24, IDC_LOCATION);
+                                      24, 638, 318, 24, IDC_LOCATION);
             set_font(g_location, g_small_font);
             make_control(0, L"BUTTON", L"选择 TT", WS_TABSTOP | BS_OWNERDRAW,
-                         347, 573, 93, 35, IDC_CHOOSE_TT);
+                         347, 629, 93, 35, IDC_CHOOSE_TT);
             make_control(0, L"BUTTON", L"启动 TT", WS_TABSTOP | BS_OWNERDRAW,
-                         448, 573, 95, 35, IDC_START_TT);
+                         448, 629, 95, 35, IDC_START_TT);
             HWND note = make_control(0, L"STATIC", L"曲线仅保留最近 30 秒；目标值与实际发送会有差异。",
-                                     0, 24, 624, 520, 22, 0);
+                                     0, 24, 680, 520, 22, 0);
             set_font(note, g_small_font);
             SetTimer(window, IDT_METRIC, 1000, NULL);
             PostMessageW(window, WM_START_METRIC, 0, 0);
@@ -683,6 +731,10 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LP
             }
             if (HIWORD(wparam) == BN_CLICKED && LOWORD(wparam) == IDC_READ) {
                 start_work(g_edition, FALSE, 0, FALSE); return 0;
+            }
+            if (HIWORD(wparam) == BN_CLICKED && (LOWORD(wparam) == IDC_MONO || LOWORD(wparam) == IDC_STEREO)) {
+                start_operation(g_edition, FALSE, 0, FALSE, LOWORD(wparam) == IDC_STEREO ? 2 : 1);
+                return 0;
             }
             if (HIWORD(wparam) == BN_CLICKED && LOWORD(wparam) == IDC_APPLY) {
                 wchar_t input[16], *end = NULL;

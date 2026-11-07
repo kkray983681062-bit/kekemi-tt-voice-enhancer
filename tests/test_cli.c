@@ -10,7 +10,7 @@ int main(int argc, char **argv) {
     if (argc == 2 && strcmp(argv[1], "--read") == 0) {
         result = tt_read_config();
         action = "READ";
-    } else if (argc == 3 && strcmp(argv[1], "--set") == 0) {
+    } else if (argc == 3 && (strcmp(argv[1], "--set") == 0 || strcmp(argv[1], "--channels") == 0)) {
         char *end = NULL;
         errno = 0;
         long value = strtol(argv[2], &end, 10);
@@ -18,8 +18,13 @@ int main(int argc, char **argv) {
             puts("OUT_OF_RANGE");
             return 1;
         }
-        result = tt_apply_bitrate((int)value);
-        action = "APPLIED";
+        if (strcmp(argv[1], "--channels") == 0) {
+            result = tt_apply_channels_for(TT_EDITION_GAME, (int)value);
+            action = "CHANNELS";
+        } else {
+            result = tt_apply_bitrate((int)value);
+            action = "APPLIED";
+        }
     } else {
         puts("BAD_ARGUMENTS");
         return 1;
@@ -28,7 +33,10 @@ int main(int argc, char **argv) {
         printf("%s %lu\n", tt_code_name(result.code), (unsigned long)result.system_error);
         return 1;
     }
-    printf("%s %d %d %d\n", action, result.config.bitrate,
+    printf("%s %d %d %d", action, result.config.bitrate,
            result.config.channel, result.config.codec);
+    if (strcmp(action, "CHANNELS") == 0)
+        printf(" CAPTURE %d ENCODER %d", result.capture_channels, result.encoder_channels);
+    putchar('\n');
     return 0;
 }

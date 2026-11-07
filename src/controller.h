@@ -25,7 +25,9 @@ typedef enum {
     TT_REMOTE_FAILED,
     TT_REMOTE_TIMEOUT,
     TT_READBACK_MISMATCH,
-    TT_SYSTEM_ERROR
+    TT_SYSTEM_ERROR,
+    TT_CHANNEL_NOT_EFFECTIVE,
+    TT_RESTORE_FAILED
 } TTCode;
 
 typedef struct {
@@ -33,12 +35,16 @@ typedef struct {
     DWORD system_error;
     DWORD pid;
     AudioConfig config;
+    int capture_channels;
+    int encoder_channels;
 } TTResult;
 
 TTResult tt_read_config(void);
 TTResult tt_apply_bitrate(int bitrate);
 TTResult tt_read_config_for(TTEdition edition);
 TTResult tt_apply_bitrate_for(TTEdition edition, int bitrate);
+/* Verified game 52035 / entertainment 52036 SDKs. Preserves bitrate/codec. */
+TTResult tt_apply_channels_for(TTEdition edition, int channels);
 const char *tt_code_name(TTCode code);
 
 #endif
